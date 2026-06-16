@@ -9,10 +9,27 @@ import pdfplumber
 
 
 def discover_pdfs(folder: Path) -> list[Path]:
+    """
+    Recursively find all PDF files under *folder*.
+
+    Returns a sorted list of Path objects so that ingestion order is
+    deterministic across runs (important for reproducible chunk IDs).
+    """
     return sorted([p for p in folder.rglob("*.pdf") if p.is_file()])
 
 
 def infer_tax_year(text: str, filename: str) -> str | None:
+    """
+    Heuristically determine the tax year from filename + first-page text.
+
+    Looks for 4-digit numbers in the range 2000-2100 appearing in either
+    the filename or the first 2000 characters of text. Returns the FIRST
+    match found (so "2023 W-2" → "2023").
+
+    This is a heuristic — a document that happens to mention "2025" as
+    a projection would be misidentified. For production, you'd want a
+    more robust rule (e.g., prefer the latest year, or look for "Tax Year" labels).
+    """
     matches = re.findall(r"\b(20\d{2})\b", f"{filename} {text[:2000]}")
     for m in matches:
         year = int(m)
@@ -22,6 +39,17 @@ def infer_tax_year(text: str, filename: str) -> str | None:
 
 
 def infer_doc_type(filename: str, text: str) -> str:
+    """
+    Classify the document type from filename + first ~3000 chars of text.
+
+    Order matters — we check W-2 before 1040 because "1040" might appear
+    in a Schedule that ships with a 1040, but the word "schedule" combined
+    with "1040" gets its own label.
+
+    Returns one of:
+      w2, 1099-div, 1099-b, 1040, 1040-schedule, ma-form-1,
+      india-us-treaty, tax-document (fallback generic)
+    """
     hay = f"{filename.lower()}\n{text.lower()[:3000]}"
     if "w-2" in hay or "w2" in hay:
         return "w2"
@@ -41,6 +69,20 @@ def infer_doc_type(filename: str, text: str) -> str:
 
 
 def _table_to_markdown(table: list[list[Any]]) -> str:
+    """
+    Convert a pdfplumber table (list of rows of cells) to GitHub-flavored
+    markdown table syntax.
+
+    pdfplumber returns tables as lists of rows, where each row is a list
+    of cell values (or None for empty cells). We:
+      1. Replace None with "".
+      2. Normalize all rows to the same column count.
+      3. Use the first row as the markdown header.
+      4. Add a separator row (|---|---|).
+      5. Render remaining rows as data rows.
+
+    Returns an empty string if the table has no rows after cleanup.
+    """
     cleaned = [["" if cell is None else str(cell).strip() for cell in row] for row in table if row]
     if not cleaned:
         return ""
@@ -58,6 +100,27 @@ def _table_to_markdown(table: list[list[Any]]) -> str:
 
 
 def parse_pdf(path: Path) -> dict[str, Any]:
+    """
+    Parse a single PDF file into a structured dictionary.
+
+    Strategy:
+      1. Primary: pdfplumber — excellent text + table extraction.
+         Tables are converted to markdown and prefixed with [TABLE].
+      2. Fallback: PyMuPDF (fitz) — used on any page where pdfplumber
+         returned empty text. This handles scanned PDFs or unusual layouts
+         that pdfplumber can't parse.
+
+    Returns a dict with:
+      path       – absolute path to the file
+      filename   – just the filename
+      doc_type   – inferred form type (w2, 1040, etc.)
+      tax_year   – inferred year or None
+      pages      – list of dicts, each with page_num, text, tables
+      page_count – total pages
+
+    The [TABLE] marker in the text allows downstream components (chunker,
+    LLM) to distinguish tabular data from running text.
+    """
     pages: list[dict[str, Any]] = []
     first_page_text = ""
 
@@ -85,6 +148,10 @@ def parse_pdf(path: Path) -> dict[str, Any]:
             if idx == 1:
                 first_page_text = page_text
 
+    # ── Fallback: PyMuPDF for empty pages ──────────────────────────
+    # pdfplumber sometimes extracts nothing from image-heavy PDFs.
+    # PyMuPDF handles a wider range of formats. We only re-extract
+    # pages that came back empty.
     if any(not p["text"] for p in pages):
         fitz_doc = fitz.open(path)
         for p in pages:
@@ -96,6 +163,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                 if fallback_text:
                     p["text"] = fallback_text
 
+    # ── Metadata inference ────────────────────────────────────────
     non_empty_pages = [p for p in pages if p["text"].strip()]
     doc_text_preview = non_empty_pages[0]["text"] if non_empty_pages else ""
     tax_year = infer_tax_year(first_page_text or doc_text_preview, path.name)
@@ -112,6 +180,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
 
 
 def parse_pdfs(paths: list[Path]) -> list[dict[str, Any]]:
+    """Convenience: parse a list of PDF paths."""
     docs = []
     for path in paths:
         docs.append(parse_pdf(path))

@@ -11,9 +11,18 @@ from query_pipeline import QueryEngine
 from structured_extractor import load_tax_summary
 from vector_store import VectorStore
 
+# ── Global setup (runs once at import time) ──────────────────────────
+# These objects live for the entire process lifetime and are shared
+# across all user sessions (fine for a single-user local app).
 
 config = get_config()
+
+# Vector store (= ChromaDB persistent collection). Loads existing data
+# from data/chroma_db/ on construction.
 vector_store = VectorStore(config)
+
+# Keyword index (= BM25). Starts empty; populated either by loading the
+# persisted pickle or by running a fresh ingestion.
 keyword_index = KeywordIndex()
 
 if config.bm25_path.exists():
@@ -22,10 +31,20 @@ if config.bm25_path.exists():
     except Exception:
         keyword_index = KeywordIndex()
 
+# The query engine wires everything together: vector store + keyword index
+# + LLM client. Exposes both ask() and stream_answer().
 query_engine = QueryEngine(config, vector_store, keyword_index)
 
 
+# ── UI action handlers ───────────────────────────────────────────────
+
 def ingest_action(folder_path: str, force_reingest: bool) -> str:
+    """
+    Handler for the "Ingest Documents" button.
+
+    Validates input, delegates to ingest_folder(), and returns a
+    human-readable status message.
+    """
     if not folder_path:
         return "Please provide a folder path."
     try:
@@ -49,6 +68,22 @@ def ingest_action(folder_path: str, force_reingest: bool) -> str:
 
 
 def chat_action(message: str, history: list[dict[str, str]] | None):
+    """
+    Generator for the chat "Send" button.
+
+    This is a Gradio streaming function — it yields (history, input_box)
+    tuples repeatedly. Each yield triggers a UI update, so the assistant's
+    reply appears token-by-token instead of all at once at the end.
+
+    Protocol:
+      1. Append user message to history.
+      2. Append empty assistant message (placeholder).
+      3. Call query_engine.stream_answer() which yields two event types:
+         - {"type": "meta", "sources": [...], ...}
+         - {"type": "token", "content": "..."}
+      4. For each token, append it to the last assistant message and yield.
+      5. After streaming, append source citations to the final reply.
+    """
     history = history or []
     if not message.strip():
         yield history, ""
@@ -67,6 +102,7 @@ def chat_action(message: str, history: list[dict[str, str]] | None):
 
     reply_parts: list[str] = []
     source_lines = ""
+    # Pass the chat history minus the just-added empty assistant turn
     for event in query_engine.stream_answer(message, _history_as_pairs(history[:-2])):
         if event.get("type") == "meta":
             sources = event.get("sources", [])
@@ -87,6 +123,17 @@ def chat_action(message: str, history: list[dict[str, str]] | None):
 
 
 def _history_as_pairs(history: list[dict[str, str]]) -> list[tuple[str, str]]:
+    """
+    Convert Gradio's flat message list into (user, assistant) tuples.
+
+    Gradio's Chatbot component stores messages as:
+      [{"role": "user", "content": "..."},
+       {"role": "assistant", "content": "..."},
+       ...]
+
+    The query engine expects [(user_msg, bot_msg), ...] so we pair each
+    user message with the following assistant message.
+    """
     pairs: list[tuple[str, str]] = []
     current_user = ""
     for msg in history:
@@ -101,6 +148,14 @@ def _history_as_pairs(history: list[dict[str, str]]) -> list[tuple[str, str]]:
 
 
 def structured_summary_action() -> str:
+    """
+    Handler for the "Show Structured Summary" button.
+
+    Loads the aggregated tax_summary.json and formats it for display
+    in a read-only textbox. Shows extracted field values plus the
+    audit trail (which regex pattern matched, which document, and
+    the exact text snippet).
+    """
     summary = load_tax_summary(config.structured_dir)
     s = summary.get("summary", {})
     if not s:
@@ -122,6 +177,10 @@ def structured_summary_action() -> str:
             lines.append(f"- {field}: {confidence} | {source_doc} | {snippet}")
     return "\n".join(lines)
 
+
+# ── Gradio UI construction ──────────────────────────────────────────
+# Using gr.Blocks (instead of gr.ChatInterface) gives us full control
+# over layout: separate ingest buttons, summary button, chat area, etc.
 
 with gr.Blocks(title="Local Tax AI Assistant") as demo:
     gr.Markdown("## Local Tax AI Assistant (Ollama + Hybrid RAG)")

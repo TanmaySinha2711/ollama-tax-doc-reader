@@ -4,12 +4,44 @@ from typing import Any
 
 
 def _safe_div(numerator: float, denominator: float) -> float | None:
+    """Divide two numbers, gracefully handling division by zero."""
     if denominator == 0:
         return None
     return numerator / denominator
 
 
 def calculate_metrics(summary: dict[str, Any]) -> dict[str, Any]:
+    """
+    Compute derived tax metrics from structured (regex-extracted) data.
+
+    This function exists because LLMs are notoriously bad at arithmetic.
+    Rather than asking the LLM to divide two numbers (which it might get
+    wrong), we do the math precisely in Python and inject the results
+    into the LLM's context. The LLM just reads and reports them.
+
+    Metrics calculated (when data is available):
+      - effective_federal_tax_rate  = total_tax / AGI × 100
+      - estimated_federal_refund    = fed_withheld - total_tax
+      - effective_ma_tax_rate       = ma_tax / ma_taxable_income × 100
+      - estimated_ma_refund         = state_withheld - ma_tax
+      - federal_vs_state_difference = total_tax - ma_tax
+
+    Fields that are missing (None) are listed in out["missing_fields"]
+    so the caller can explain to the user what data is needed.
+
+    Parameters
+    ----------
+    summary : dict
+        Should have a "summary" key containing the aggregated field values
+        from tax_summary.json. Example structure:
+          {"summary": {"w2_wages": 50000, "total_tax": 6200, ...}}
+
+    Returns
+    -------
+    dict
+        Each metric key mapped to its computed value (float) or None.
+        Also includes a "missing_fields" list for diagnostics.
+    """
     s = summary.get("summary", {})
 
     total_tax = s.get("total_tax")
@@ -29,17 +61,20 @@ def calculate_metrics(summary: dict[str, Any]) -> dict[str, Any]:
         "missing_fields": [],
     }
 
+    # ── Federal metrics ──────────────────────────────────────────────
     if total_tax is not None and agi is not None:
         rate = _safe_div(float(total_tax), float(agi))
         out["effective_federal_tax_rate"] = None if rate is None else round(rate * 100, 2)
     else:
         out["missing_fields"].append("total_tax or adjusted_gross_income")
 
+    # Refund = withheld - actual tax (positive = refund, negative = owe)
     if fed_withheld is not None and total_tax is not None:
         out["estimated_federal_refund"] = round(float(fed_withheld) - float(total_tax), 2)
     else:
         out["missing_fields"].append("federal_tax_withheld or total_tax")
 
+    # ── Massachusetts metrics ────────────────────────────────────────
     if ma_tax is not None and ma_taxable_income is not None:
         ma_rate = _safe_div(float(ma_tax), float(ma_taxable_income))
         out["effective_ma_tax_rate"] = None if ma_rate is None else round(ma_rate * 100, 2)
@@ -51,6 +86,7 @@ def calculate_metrics(summary: dict[str, Any]) -> dict[str, Any]:
     else:
         out["missing_fields"].append("state_tax_withheld or ma_tax")
 
+    # Difference between federal and state tax burden
     if total_tax is not None and ma_tax is not None:
         out["federal_vs_state_tax_difference"] = round(float(total_tax) - float(ma_tax), 2)
 
